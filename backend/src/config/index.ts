@@ -84,6 +84,8 @@ const envSchema = z.object({
   NPM_PACKAGE_VERSION: z.string().default(pkg.version ?? "0.1.0"),
   GRACEFUL_SHUTDOWN_TIMEOUT: z.coerce.number().int().positive().default(30),
   HEALTH_PROBE_TIMEOUT_MS: z.coerce.number().int().positive().default(5_000),
+  /** Job queue depth at which `/health/deep` reports the queue as degraded. */
+  HEALTH_QUEUE_DEPTH_WARN: z.coerce.number().int().positive().default(1_000),
 
   CACHE_DRIVER: z.enum(["lru", "redis"]).default("lru"),
   REDIS_URL: z.string().default("redis://localhost:6379"),

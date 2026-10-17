@@ -48,6 +48,8 @@ export class CircuitBreaker {
   private state: CircuitState = 'CLOSED';
   private failures = 0;
   private openedAt = 0;
+  private lastSuccessAt: number | null = null;
+  private lastFailureAt: number | null = null;
   private readonly failureThreshold: number;
   private readonly recoveryTimeoutMs: number;
   private readonly nowFn: () => number;
@@ -101,6 +103,7 @@ export class CircuitBreaker {
   recordSuccess(): void {
     const prev = this.state;
     this.failures = 0;
+    this.lastSuccessAt = this.nowFn();
     this.state = 'CLOSED';
     if (prev !== 'CLOSED') {
       this.emit(prev, 'CLOSED');
@@ -109,6 +112,7 @@ export class CircuitBreaker {
 
   recordFailure(): void {
     this.failures++;
+    this.lastFailureAt = this.nowFn();
     if (this.failures >= this.failureThreshold) {
       const prev = this.state;
       this.state = 'OPEN';
@@ -127,6 +131,8 @@ export class CircuitBreaker {
     failureThreshold: number;
     recoveryTimeoutMs: number;
     openedAt: number | null;
+    lastSuccessAt: number | null;
+    lastFailureAt: number | null;
   } {
     this.evaluateTimeout();
     return {
@@ -136,6 +142,8 @@ export class CircuitBreaker {
       failureThreshold: this.failureThreshold,
       recoveryTimeoutMs: this.recoveryTimeoutMs,
       openedAt: this.state !== 'CLOSED' ? this.openedAt : null,
+      lastSuccessAt: this.lastSuccessAt,
+      lastFailureAt: this.lastFailureAt,
     };
   }
 
@@ -182,7 +190,88 @@ export function getAllCircuitBreakerStatuses(): ReturnType<CircuitBreaker['getSt
   return Array.from(registry.values()).map((b) => b.getStatus());
 }
 
-/** Remove all registered breakers — intended for tests only. */
+// ── Tracked breakers — instances owned by their callers ──────────────────────
+
+/**
+ * Breakers constructed directly (e.g. one per `VeniceClient`) rather than via
+ * the named registry. Several instances may share a name, so health checks
+ * aggregate them with {@link summarizeCircuitBreakers}.
+ */
+const tracked = new Set<CircuitBreaker>();
+
+/**
+ * Make a caller-owned breaker visible to health checks.
+ * Returns an unsubscribe function; call it when the owner is disposed.
+ */
+export function trackCircuitBreaker(breaker: CircuitBreaker): () => void {
+  tracked.add(breaker);
+  return () => {
+    tracked.delete(breaker);
+  };
+}
+
+export type CircuitBreakerStatus = ReturnType<CircuitBreaker['getStatus']>;
+
+export interface CircuitBreakerSummary {
+  name: string;
+  /** Worst state across instances: OPEN > HALF_OPEN > CLOSED. */
+  state: CircuitState;
+  /** Instances sharing this name (registered and tracked). */
+  instances: number;
+  /** Instances currently OPEN. */
+  openInstances: number;
+  /** Highest consecutive-failure count of any instance. */
+  failures: number;
+  /** Most recent success across instances (epoch ms), or null if none yet. */
+  lastSuccessAt: number | null;
+  /** Most recent failure across instances (epoch ms), or null if none yet. */
+  lastFailureAt: number | null;
+}
+
+const STATE_SEVERITY: Record<CircuitState, number> = { CLOSED: 0, HALF_OPEN: 1, OPEN: 2 };
+
+function maxNullable(a: number | null, b: number | null): number | null {
+  if (a === null) return b;
+  if (b === null) return a;
+  return Math.max(a, b);
+}
+
+/**
+ * Aggregate every registered or tracked breaker named `name` into a single
+ * status. Returns null when no breaker with that name exists yet (e.g. the
+ * owning client has not been constructed).
+ */
+export function summarizeCircuitBreakers(name: string): CircuitBreakerSummary | null {
+  const instances = new Set<CircuitBreaker>();
+  const registered = registry.get(name);
+  if (registered) instances.add(registered);
+  for (const breaker of tracked) {
+    if (breaker.name === name) instances.add(breaker);
+  }
+  if (instances.size === 0) return null;
+
+  const summary: CircuitBreakerSummary = {
+    name,
+    state: 'CLOSED',
+    instances: instances.size,
+    openInstances: 0,
+    failures: 0,
+    lastSuccessAt: null,
+    lastFailureAt: null,
+  };
+  for (const breaker of instances) {
+    const status = breaker.getStatus();
+    if (STATE_SEVERITY[status.state] > STATE_SEVERITY[summary.state]) summary.state = status.state;
+    if (status.state === 'OPEN') summary.openInstances++;
+    summary.failures = Math.max(summary.failures, status.failures);
+    summary.lastSuccessAt = maxNullable(summary.lastSuccessAt, status.lastSuccessAt);
+    summary.lastFailureAt = maxNullable(summary.lastFailureAt, status.lastFailureAt);
+  }
+  return summary;
+}
+
+/** Remove all registered and tracked breakers — intended for tests only. */
 export function _resetCircuitBreakerRegistry(): void {
   registry.clear();
+  tracked.clear();
 }

@@ -1,6 +1,7 @@
 import { randomUUID } from 'node:crypto';
 import { createLogger } from '../../utils/logger.js';
 import { CircuitBreaker } from './circuitBreaker.js';
+import { trackCircuitBreaker } from '../circuitBreaker.js';
 import { CircuitOpenError, TokenBudgetExceededError, VeniceStatusError } from './errors.js';
 import { VeniceResponseCache, buildCacheKey } from './cache.js';
 import { RequestDeduplicator } from './dedup.js';
@@ -164,6 +165,8 @@ export class VeniceClient implements VeniceClientLike {
 
   constructor(config: VeniceClientConfig) {
     this.breaker = config.circuitBreaker ?? new CircuitBreaker({ name: 'venice' });
+    // Expose this breaker to `/health/deep`; untracked again in dispose().
+    this.circuitUnsubscribers.push(trackCircuitBreaker(this.breaker));
 
     const env = this.resolveConfig() as any;
     this.modelVersion = config.modelVersion ?? env.VENICE_MODEL_VERSION ?? CONFIG_FALLBACK.VENICE_MODEL_VERSION;

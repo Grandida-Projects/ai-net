@@ -349,12 +349,57 @@ List endpoints support standardized query parameters:
             stellarNetwork: { type: "string", example: "testnet" },
           },
         },
+        DependencyHealth: {
+          type: "object",
+          required: ["status", "critical", "latencyMs", "detail"],
+          additionalProperties: true,
+          properties: {
+            status: { type: "string", enum: ["ok", "degraded", "fail"], example: "ok" },
+            critical: { type: "boolean", example: true },
+            latencyMs: { type: "number", example: 42 },
+            detail: { type: "string", example: "reachable" },
+          },
+        },
         DeepHealthStatus: {
           type: "object",
-          required: ["venice", "horizon"],
+          required: ["status", "checkedAt", "durationMs", "dependencies", "failing", "degraded"],
           properties: {
-            venice: { type: "string", enum: ["ok", "unreachable"], example: "ok" },
-            horizon: { type: "string", enum: ["ok", "unreachable"], example: "ok" },
+            status: { type: "string", enum: ["ok", "degraded", "fail"], example: "ok" },
+            checkedAt: { type: "string", format: "date-time" },
+            durationMs: { type: "number", example: 120 },
+            dependencies: {
+              type: "object",
+              properties: {
+                venice: {
+                  allOf: [{ $ref: "#/components/schemas/DependencyHealth" }],
+                  description: "Includes `breaker` (state, failures, lastSuccessAt, lastFailureAt) and `lastSuccessAt`.",
+                },
+                horizon: {
+                  allOf: [{ $ref: "#/components/schemas/DependencyHealth" }],
+                  description: "Includes `breaker` for the stellar-horizon circuit, or null if none is registered.",
+                },
+                database: {
+                  allOf: [{ $ref: "#/components/schemas/DependencyHealth" }],
+                  description: "Includes `readOnlyMode`; the write check is skipped while it is true.",
+                },
+                queue: {
+                  allOf: [{ $ref: "#/components/schemas/DependencyHealth" }],
+                  description: "Non-critical. Includes `depth`, `active`, `deadLetter` and `threshold`.",
+                },
+              },
+            },
+            failing: { type: "array", items: { type: "string" }, description: "Critical dependencies that failed" },
+            degraded: { type: "array", items: { type: "string" }, description: "Dependencies that are degraded, or non-critical and failing" },
+            services: {
+              type: "object",
+              description: "Legacy summary, kept for backward compatibility.",
+              properties: {
+                venice: { type: "string", enum: ["ok", "unreachable"] },
+                horizon: { type: "string", enum: ["ok", "unreachable"] },
+              },
+            },
+            venice: { type: "string", enum: ["ok", "unreachable"], description: "Legacy alias of services.venice" },
+            horizon: { type: "string", enum: ["ok", "unreachable"], description: "Legacy alias of services.horizon" },
           },
         },
         ReadinessStatus: {

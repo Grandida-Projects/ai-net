@@ -1,5 +1,5 @@
 /**
- * Unit tests for GET /health, GET /health/deep, and GET /health/ready routes.
+ * Unit tests for GET /health, GET /health/deep, GET /health/ready and GET /health/queue routes.
  *
  * Strategy:
  *  - Load config once at the top of the file.
@@ -69,27 +69,71 @@ describe("GET /health", () => {
 // ── GET /health/deep ─────────────────────────────────────────────────────────
 
 describe("GET /health/deep", () => {
+  /* eslint-disable @typescript-eslint/no-var-requires */
+  const Database = require("better-sqlite3");
+  const tasksModule = require("../../db/tasks");
+  const adminControl = require("../../services/adminControl");
+  const jobStoreModule = require("../../queue/jobStore");
+  const breakers = require("../../services/circuitBreaker");
+  /* eslint-enable @typescript-eslint/no-var-requires */
+
   let fetchSpy: jest.SpyInstance;
+  let queueStats: { pending: number; active: number; completed: number; failed: number; deadLetter: number; total: number };
+  let db: InstanceType<typeof Database>;
 
   beforeEach(() => {
-    // Spy on global fetch — the router uses the global fetch internally
-    fetchSpy = jest.spyOn(global, "fetch" as any);
+    // Spy on global fetch — the probe uses the global fetch internally
+    fetchSpy = jest.spyOn(global, "fetch" as any).mockResolvedValue({ ok: true } as Response);
+    db = new Database(":memory:");
+    jest.spyOn(tasksModule, "getTaskDb").mockReturnValue(db);
+    jest.spyOn(adminControl, "isReadOnly").mockReturnValue(false);
+    queueStats = { pending: 0, active: 0, completed: 0, failed: 0, deadLetter: 0, total: 0 };
+    jest.spyOn(jobStoreModule, "getJobDb").mockReturnValue({});
+    jest.spyOn(jobStoreModule, "createJobStore").mockImplementation(() => ({ getStats: () => queueStats }));
+    breakers._resetCircuitBreakerRegistry();
   });
 
   afterEach(() => {
-    fetchSpy.mockRestore();
+    jest.restoreAllMocks();
+    breakers._resetCircuitBreakerRegistry();
+    db.close();
   });
 
-  it("returns 200 with both ok when all dependencies reachable", async () => {
-    fetchSpy.mockResolvedValue({ ok: true } as Response);
+  it("returns 200 with structured per-dependency results when all dependencies are healthy", async () => {
     const app = buildApp();
     const res = await request(app).get("/health/deep");
     expect(res.status).toBe(200);
+    expect(res.body.status).toBe("ok");
+    for (const name of ["venice", "horizon", "database", "queue"]) {
+      const dep = res.body.dependencies[name];
+      expect(dep.status).toBe("ok");
+      expect(typeof dep.critical).toBe("boolean");
+      expect(typeof dep.latencyMs).toBe("number");
+      expect(typeof dep.detail).toBe("string");
+    }
+    // Legacy flat fields are preserved.
     expect(res.body.venice).toBe("ok");
     expect(res.body.horizon).toBe("ok");
+    expect(res.body.services).toEqual({ venice: "ok", horizon: "ok" });
   });
 
-  it("reports venice as unreachable when Venice fetch rejects", async () => {
+  it("returns 503 when the Venice circuit breaker is OPEN, even if the probe succeeds", async () => {
+    const breaker = new breakers.CircuitBreaker({ name: "venice", failureThreshold: 1 });
+    breakers.trackCircuitBreaker(breaker);
+    breaker.recordSuccess();
+    breaker.recordFailure();
+
+    const app = buildApp();
+    const res = await request(app).get("/health/deep");
+    expect(res.status).toBe(503);
+    expect(res.body.status).toBe("fail");
+    expect(res.body.failing).toContain("venice");
+    expect(res.body.dependencies.venice.breaker.state).toBe("OPEN");
+    expect(typeof res.body.dependencies.venice.lastSuccessAt).toBe("string");
+    expect(res.body.venice).toBe("unreachable");
+  });
+
+  it("returns 503 and reports venice as unreachable when Venice fetch rejects", async () => {
     fetchSpy.mockImplementation((url: string) => {
       if (url.includes("venice.ai")) {
         return Promise.reject(new Error("network error"));
@@ -98,12 +142,13 @@ describe("GET /health/deep", () => {
     });
     const app = buildApp();
     const res = await request(app).get("/health/deep");
-    expect(res.status).toBe(200);
+    expect(res.status).toBe(503);
     expect(res.body.venice).toBe("unreachable");
     expect(res.body.horizon).toBe("ok");
+    expect(res.body.failing).toEqual(["venice"]);
   });
 
-  it("reports horizon as unreachable when Horizon fetch rejects", async () => {
+  it("returns 503 and reports horizon as unreachable when Horizon fetch rejects", async () => {
     fetchSpy.mockImplementation((url: string) => {
       if (url.includes("venice.ai")) {
         return Promise.resolve({ ok: true } as Response);
@@ -112,16 +157,25 @@ describe("GET /health/deep", () => {
     });
     const app = buildApp();
     const res = await request(app).get("/health/deep");
-    expect(res.status).toBe(200);
+    expect(res.status).toBe(503);
     expect(res.body.venice).toBe("ok");
     expect(res.body.horizon).toBe("unreachable");
+  });
+
+  it("returns 503 when the Stellar Horizon breaker is OPEN", async () => {
+    const breaker = breakers.getCircuitBreaker({ name: "stellar-horizon", failureThreshold: 1 });
+    breaker.recordFailure();
+    const app = buildApp();
+    const res = await request(app).get("/health/deep");
+    expect(res.status).toBe(503);
+    expect(res.body.failing).toEqual(["horizon"]);
   });
 
   it("reports both unreachable when both dependencies return non-ok status", async () => {
     fetchSpy.mockResolvedValue({ ok: false } as Response);
     const app = buildApp();
     const res = await request(app).get("/health/deep");
-    expect(res.status).toBe(200);
+    expect(res.status).toBe(503);
     expect(res.body.venice).toBe("unreachable");
     expect(res.body.horizon).toBe("unreachable");
   });
@@ -131,9 +185,39 @@ describe("GET /health/deep", () => {
     fetchSpy.mockRejectedValue(abortError);
     const app = buildApp();
     const res = await request(app).get("/health/deep");
-    expect(res.status).toBe(200);
+    expect(res.status).toBe(503);
     expect(res.body.venice).toBe("unreachable");
     expect(res.body.horizon).toBe("unreachable");
+  });
+
+  it("returns 503 when the database write check fails", async () => {
+    tasksModule.getTaskDb.mockImplementation(() => {
+      throw new Error("SQLITE_CANTOPEN");
+    });
+    const app = buildApp();
+    const res = await request(app).get("/health/deep");
+    expect(res.status).toBe(503);
+    expect(res.body.failing).toEqual(["database"]);
+  });
+
+  it("stays 200 in read-only mode and skips the write check", async () => {
+    adminControl.isReadOnly.mockReturnValue(true);
+    const app = buildApp();
+    const res = await request(app).get("/health/deep");
+    expect(res.status).toBe(200);
+    expect(res.body.dependencies.database.readOnlyMode).toBe(true);
+    expect(res.body.dependencies.database.detail).toMatch(/write check skipped/);
+  });
+
+  it("returns 200 with degraded flags when only the queue is backlogged", async () => {
+    queueStats.pending = 5_000;
+    const app = buildApp();
+    const res = await request(app).get("/health/deep");
+    expect(res.status).toBe(200);
+    expect(res.body.status).toBe("degraded");
+    expect(res.body.degraded).toEqual(["queue"]);
+    expect(res.body.dependencies.queue.depth).toBe(5_000);
+    expect(res.body.dependencies.queue.critical).toBe(false);
   });
 });
 
