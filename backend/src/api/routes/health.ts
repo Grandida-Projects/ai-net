@@ -5,6 +5,7 @@ import { metricsService } from "../../services/metrics";
 import { tracingService } from "../../services/tracing";
 import { getAllCircuitBreakerStatuses } from "../../services/circuitBreaker.js";
 import { readMigrationStatus } from "../../db/migrations/status";
+import { runDeepHealthCheck, queueDepthOf } from "../../services/deepHealth";
 
 const router = Router();
 const startTime = Date.now();
@@ -64,18 +65,27 @@ router.get("/live", livenessHandler);
  *   get:
  *     summary: Dependency health check
  *     operationId: getDeepHealth
- *     description: Probes the Venice AI API and the configured Stellar Horizon endpoint, reporting 503 when either is unreachable.
+ *     description: >
+ *       Probes every upstream the service needs to do useful work and reports
+ *       per-dependency `status`, `critical`, `latencyMs` and `detail`:
+ *       Venice AI (circuit-breaker state, last success, reachability), Stellar
+ *       Horizon (reachability, breaker state), the task database (a
+ *       non-persisting write check, skipped in read-only mode) and the job
+ *       queue (depth against `HEALTH_QUEUE_DEPTH_WARN`). Answers 503 when a
+ *       critical dependency fails, and 200 with `status: degraded` when only
+ *       non-critical checks are unhealthy. Use this for readiness/traffic
+ *       gating; use `/health/live` for container liveness.
  *     tags: [Health]
  *     security: []
  *     responses:
  *       200:
- *         description: All dependencies reachable
+ *         description: All critical dependencies healthy (status `ok` or `degraded`)
  *         content:
  *           application/json:
  *             schema:
  *               $ref: '#/components/schemas/DeepHealthStatus'
  *       503:
- *         description: At least one dependency is unreachable
+ *         description: At least one critical dependency is failing
  *         content:
  *           application/json:
  *             schema:
@@ -83,25 +93,52 @@ router.get("/live", livenessHandler);
  */
 router.get("/deep", cachedRoute("health"), async (_req: Request, res: Response) => {
   const config = getConfig();
-  const timeoutMs = config.HEALTH_PROBE_TIMEOUT_MS;
-  const [veniceStatus, horizonStatus] = await Promise.all([
-    checkVenice(config.VENICE_API_KEY, timeoutMs),
-    checkHorizon(config.STELLAR_HORIZON_URL, timeoutMs),
-  ]);
-
-  const allOk = veniceStatus === "ok" && horizonStatus === "ok";
-  // `/health/deep` always answers 200 and reports the per-dependency detail:
-  // a degraded upstream is not a failed probe of *this* service. Readiness is
-  // gated by `/health/ready`, which answers 500 when a check reports an error.
-  res.status(200).json({
-    status: allOk ? "ok" : "degraded",
-    services: {
-      venice: veniceStatus,
-      horizon: horizonStatus,
-    },
-    venice: veniceStatus,
-    horizon: horizonStatus,
+  const report = await runDeepHealthCheck({
+    veniceApiKey: config.VENICE_API_KEY,
+    horizonUrl: config.STELLAR_HORIZON_URL,
+    timeoutMs: config.HEALTH_PROBE_TIMEOUT_MS,
+    queueDepthWarn: config.HEALTH_QUEUE_DEPTH_WARN,
   });
+
+  const legacy = (name: "venice" | "horizon") =>
+    report.dependencies[name].status === "fail" ? "unreachable" : "ok";
+
+  res.status(report.status === "fail" ? 503 : 200).json({
+    ...report,
+    // Flat summary fields from the original probe, kept for existing consumers.
+    services: { venice: legacy("venice"), horizon: legacy("horizon") },
+    venice: legacy("venice"),
+    horizon: legacy("horizon"),
+  });
+});
+
+/**
+ * @openapi
+ * /health/queue:
+ *   get:
+ *     summary: Job queue depth
+ *     operationId: getQueueHealth
+ *     description: Queue depth (pending + failed), active jobs and dead-letter count.
+ *     tags: [Health]
+ *     security: []
+ *     responses:
+ *       200:
+ *         description: Queue statistics
+ *       500:
+ *         description: Queue statistics could not be read
+ */
+router.get("/queue", async (_req: Request, res: Response) => {
+  try {
+    const { getJobDb, createJobStore } = await import("../../queue/jobStore.js");
+    const stats = createJobStore(getJobDb()).getStats();
+    res.json({
+      queueDepth: queueDepthOf(stats),
+      activeJobs: stats.active,
+      deadLetterCount: stats.deadLetter,
+    });
+  } catch (error) {
+    res.status(500).json({ error: "Failed to read queue stats", message: String(error) });
+  }
 });
 
 /**

@@ -65,42 +65,8 @@ All error responses return a standardized JSON error envelope:
 
 ### 3.1 Health & Diagnostics
 
-#### `GET /health`
-Returns overall system status and upstream dependency health (Database, Redis, Stellar RPC).
-
-* **Request**:
-  ```bash
-  curl -s http://localhost:3000/health
-  ```
-
-* **Response (`200 OK`)**:
-  ```json
-  {
-    "status": "healthy",
-    "timestamp": "2026-08-29T10:00:00.000Z",
-    "services": {
-      "database": "connected",
-      "redis": "connected",
-      "stellarRpc": "connected"
-    }
-  }
-  ```
-
-#### `GET /health/ready`
-Kubernetes readiness probe. Returns `200` when the node is ready to accept traffic.
-
-* **Request**:
-  ```bash
-  curl -s http://localhost:3000/health/ready
-  ```
-
-* **Response (`200 OK`)**:
-  ```json
-  { "ready": true }
-  ```
-
-#### `GET /health/live`
-Kubernetes liveness probe.
+#### `GET /health` / `GET /health/live`
+Liveness probe. Process-only: reports uptime, build version and Stellar network, and **never** probes a dependency, so it stays cheap and cannot fail because an upstream is down. Use it for container `HEALTHCHECK`s and Kubernetes `livenessProbe`s.
 
 * **Request**:
   ```bash
@@ -109,8 +75,77 @@ Kubernetes liveness probe.
 
 * **Response (`200 OK`)**:
   ```json
-  { "live": true }
+  { "status": "ok", "uptime": 120, "version": "0.1.0", "stellarNetwork": "testnet" }
   ```
+
+#### `GET /health/deep`
+Dependency-aware probe. Use it for Kubernetes `readinessProbe`s and load-balancer health checks so traffic is drained while inference or settlement is failing.
+
+| Dependency | Critical | What is checked |
+| :--- | :---: | :--- |
+| `venice` | yes | Venice AI circuit-breaker state (aggregated across agent clients) and last success, plus a reachability probe of the models endpoint. An `OPEN` breaker fails even if the probe succeeds; `HALF_OPEN` is `degraded`. |
+| `horizon` | yes | Stellar Horizon reachability and the `stellar-horizon` breaker state. |
+| `database` | yes | Non-persisting write check on the task DB (`BEGIN IMMEDIATE` + `ROLLBACK`). Skipped — read check only — while admin read-only mode is on. A contended write lock is `degraded`. |
+| `queue` | no | Job queue depth (`pending + failed`); `degraded` at or above `HEALTH_QUEUE_DEPTH_WARN` (default `1000`). |
+
+* **Status codes**: `503` when any critical dependency has `status: "fail"`; otherwise `200`, with top-level `status` of `ok` or `degraded` and the offending names in `degraded`.
+* **Probe timeout**: `HEALTH_PROBE_TIMEOUT_MS` (default `5000`) per upstream request.
+
+* **Request**:
+  ```bash
+  curl -s http://localhost:3000/health/deep
+  ```
+
+* **Response (`503 Service Unavailable`)**:
+  ```json
+  {
+    "status": "fail",
+    "checkedAt": "2026-10-17T10:00:00.000Z",
+    "durationMs": 184,
+    "failing": ["venice"],
+    "degraded": [],
+    "dependencies": {
+      "venice": {
+        "status": "fail",
+        "critical": true,
+        "latencyMs": 182,
+        "detail": "circuit breaker OPEN (3 consecutive failures); probe: reachable",
+        "breaker": {
+          "state": "OPEN",
+          "instances": 5,
+          "openInstances": 1,
+          "failures": 3,
+          "lastSuccessAt": "2026-10-17T09:58:41.120Z",
+          "lastFailureAt": "2026-10-17T09:59:57.002Z"
+        },
+        "lastSuccessAt": "2026-10-17T09:58:41.120Z"
+      },
+      "horizon": { "status": "ok", "critical": true, "latencyMs": 95, "detail": "reachable", "breaker": null },
+      "database": { "status": "ok", "critical": true, "latencyMs": 1, "detail": "write check passed", "readOnlyMode": false },
+      "queue": { "status": "ok", "critical": false, "latencyMs": 1, "detail": "queue depth 12", "depth": 12, "active": 3, "deadLetter": 0, "threshold": 1000 }
+    },
+    "services": { "venice": "unreachable", "horizon": "ok" },
+    "venice": "unreachable",
+    "horizon": "ok"
+  }
+  ```
+  `services`, `venice` and `horizon` are the legacy flat summary, kept for backward compatibility.
+
+#### `GET /health/ready`
+Readiness check over the task, payment and job-queue databases, Venice, Horizon and the WebSocket listener. Returns `500` when any check reports `error`.
+
+* **Request**:
+  ```bash
+  curl -s http://localhost:3000/health/ready
+  ```
+
+* **Response (`200 OK`)**:
+  ```json
+  { "status": "ok", "checks": { "tasks": "ok", "payments": "ok", "queue": "ok", "venice": "ok", "horizon": "ok", "websocket": "unknown" } }
+  ```
+
+#### `GET /health/queue`
+Job queue statistics: `{ "queueDepth": 12, "activeJobs": 3, "deadLetterCount": 0 }`.
 
 #### `GET /metrics`
 Prometheus text exposition endpoint for metrics scraping.

@@ -310,7 +310,8 @@ services:
     ports:
       - "3001:3001"
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:3001/api/v1/health"]
+      # Liveness only — never probes upstreams. Gate traffic on /health/deep.
+      test: ["CMD", "curl", "-f", "http://localhost:3001/health/live"]
       interval: 15s
       timeout: 5s
       retries: 3
@@ -392,26 +393,17 @@ sudo systemctl status ainet-node
 
 Verify that your node is running properly and connected to Stellar:
 
-### 1. Check HTTP Health Endpoint
+### 1. Check HTTP Health Endpoints
+Liveness (cheap, never probes dependencies):
 ```bash
-curl -i http://localhost:3001/api/v1/health
+curl -i http://localhost:3001/health/live
 ```
-**Expected Response:**
-```json
-{
-  "status": "ok",
-  "version": "1.0.0",
-  "stellar": {
-    "network": "testnet",
-    "connected": true,
-    "latestLedger": 123456
-  },
-  "database": {
-    "status": "connected"
-  },
-  "uptime": 120
-}
+
+Dependency health — Venice breaker state, Horizon, a database write check and queue depth:
+```bash
+curl -i http://localhost:3001/health/deep
 ```
+**Expected:** `200 OK` with `"status": "ok"` and every entry under `dependencies` reporting `"status": "ok"`. A `503` means a critical dependency (`venice`, `horizon` or `database`) is failing — the `failing` array names it and each entry's `detail` says why. A `200` with `"status": "degraded"` means the node is serving but something needs attention (e.g. a backlogged queue or a `HALF_OPEN` breaker). See [API Reference → `GET /health/deep`](API_REFERENCE.md#get-healthdeep) for the full shape.
 
 ### 2. Verify Agent Heartbeat
 ```bash
@@ -444,6 +436,26 @@ The node exposes Prometheus-compatible metrics at `GET /metrics`:
 - `ainet_escrow_settlements_total`: Number of on-chain escrow settlements.
 - `ainet_stellar_rpc_latency_seconds`: Latency of Stellar Horizon / Soroban RPC calls.
 - `ainet_active_agents`: Current count of active registered agents.
+
+### Health Probes
+
+| Endpoint | Use for | Behaviour |
+| :--- | :--- | :--- |
+| `GET /health/live` | Docker `HEALTHCHECK`, Kubernetes `livenessProbe` | Process-only; always `200` while the process is up. |
+| `GET /health/deep` | Kubernetes `readinessProbe`, load-balancer checks, alerting | `503` when Venice (incl. an `OPEN` circuit breaker), Horizon or the database write check fails; `200` + `status: "degraded"` for non-critical issues such as queue depth ≥ `HEALTH_QUEUE_DEPTH_WARN`. |
+
+Don't point a liveness probe at `/health/deep`: an upstream outage would restart healthy pods without fixing anything.
+
+```yaml
+livenessProbe:
+  httpGet: { path: /health/live, port: 3000 }
+  periodSeconds: 10
+readinessProbe:
+  httpGet: { path: /health/deep, port: 3000 }
+  periodSeconds: 15
+  timeoutSeconds: 6   # > HEALTH_PROBE_TIMEOUT_MS
+  failureThreshold: 2
+```
 
 ### Example Prometheus Scrape Config
 
@@ -546,6 +558,7 @@ sudo systemctl start ainet-node
 * **Observability**:
   - State gauge: `ainet_venice_circuit_breaker_state` (`0` = closed, `1` = open, `2` = half-open).
   - JSON: `VeniceClient.getCircuitMetrics()` → `{ state, failures, successes, lastFailureAt, lastSuccessAt }`.
+  - HTTP: `GET /health/deep` → `dependencies.venice.breaker` (state aggregated across every agent's client) and `dependencies.venice.lastSuccessAt`; the endpoint answers `503` while the breaker is `OPEN`.
   - Transitions (`opened` / `half_opened` / `closed`) are emitted on the breaker's event bus and mirrored to the log as `venice circuit transition`.
   - While the circuit is open, cached responses are still served when `enableCacheFallback` is on (default), so a Venice outage degrades quality rather than failing every task.
 * **Tuning**: raise `VENICE_CIRCUIT_FAILURE_THRESHOLD` for a noisy upstream, or lengthen `VENICE_CIRCUIT_COOLDOWN_MS` to probe less aggressively.

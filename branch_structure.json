@@ -1,0 +1,18 @@
+{
+  "default_branch": "main",
+  "branches": [
+    "feat/deep-health-dependency-probes",
+    "main",
+    "origin"
+  ],
+  "parent": {
+    "feat/deep-health-dependency-probes": "main",
+    "main": null,
+    "origin": "main"
+  },
+  "order": [
+    "main",
+    "feat/deep-health-dependency-probes",
+    "origin"
+  ]
+}
